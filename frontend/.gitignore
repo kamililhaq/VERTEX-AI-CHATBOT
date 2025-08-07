@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Google Cloud service account keys
+backend/*.json
+
+
