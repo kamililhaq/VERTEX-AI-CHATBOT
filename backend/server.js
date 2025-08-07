@@ -8,6 +8,8 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+console.log("🚀 Starting backend server...");
+
 // Vertex AI
 const vertexAI = new VertexAI({
   project: process.env.PROJECT_ID,
