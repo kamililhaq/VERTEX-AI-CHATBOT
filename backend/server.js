@@ -1,79 +1,298 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { VertexAI } = require('@google-cloud/vertexai');
+const bodyParser = require('body-parser');
 const { Pool } = require('pg');
+const { VertexAI } = require('@google-cloud/vertexai');
+const fs = require('fs');
 
 const app = express();
-app.use(express.json());
-app.use(cors());
+app.use(cors({
+  origin: 'http://localhost:5173',
+  methods: ['GET','POST','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization'],
+  credentials: true,
+}));
+app.use(bodyParser.json());
 
-console.log("🚀 Starting backend server...");
+// PostgreSQL setup
+const pool = new Pool({
+  host: process.env.POSTGRES_HOST || 'los-rapimoney-dev.cluster-cdkyd8o8qnrt.ap-south-1.rds.amazonaws.com',
+  port: process.env.POSTGRES_PORT || 5432,
+  database: process.env.POSTGRES_DATABASE || 'los',
+  user: process.env.POSTGRES_USERNAME || 'readwriteuser',
+  password: process.env.POSTGRES_PASSWORD || 'eVF7T8k0WHqaklGLgkvG',
+  max: 20,
+  ssl: { rejectUnauthorized: false },
+});
 
-// Vertex AI
+// Load schema JSON
+function loadSchema() {
+  const raw = fs.readFileSync('./los_data_12_aug.json', 'utf8');
+  const parsed = JSON.parse(raw);
+  return JSON.parse(parsed.schema_metadata);
+}
+
+// Vertex AI setup
 const vertexAI = new VertexAI({
   project: process.env.PROJECT_ID,
   location: process.env.LOCATION || 'us-central1',
 });
-const model = vertexAI.getGenerativeModel({
+const chatModel = vertexAI.getGenerativeModel({
+  model: 'gemini-2.0-flash-exp',
+});
+const sqlModel = vertexAI.getGenerativeModel({
   model: 'gemini-2.5-flash-lite',
 });
 
-// PostgreSQL
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
-
-// 🧠 Smart AI Endpoint
-app.post('/api/ask', async (req, res) => {
-  const { question } = req.body;
-
-  const prompt = `
-You're an intelligent assistant. Decide if the user's message needs a SQL query from this DB:
-
-users(id, name, email, created_at)  
-orders(id, user_id, product_name, amount, order_date)
-
-Reply in this JSON format (and ONLY this format):
-
-{
-  "action": "sql" | "chat",
-  "sql": "..." (optional),
-  "reply": "..." (required)
-}
-
-Message: """${question}"""
-`;
-
+// Chat endpoint with Google Search grounding
+app.post('/chat', async (req, res) => {
   try {
-    const result = await model.generateContent({
-      contents: [{
-        role: 'user',
-        parts: [{ text: prompt }]
-      }],
-      generationConfig: {
-        temperature: 0.2,
-        maxOutputTokens: 512
-      }
+    const { message } = req.body;
+    if (!message) return res.status(400).json({ error: 'Message is required' });
+
+    const result = await chatModel.generateContent({
+      contents: [{ role: 'user', parts: [{ text: message }] }],
+      tools: [{ google_search: {} }],
+      generationConfig: { temperature: 0.7, maxOutputTokens: 512 },
     });
 
-    const raw = result.response.candidates?.[0]?.content?.parts?.[0]?.text || "";
-    const parsed = JSON.parse(raw);
-    console.log("==================",parsed);
-    if (parsed.action === "sql" && parsed.sql?.toLowerCase().startsWith("select")) {
-      const dbRes = await pool.query(parsed.sql);
-      return res.json({
-        answer: "```json\n" + JSON.stringify(dbRes.rows, null, 2) + "\n```",
-        sql: parsed.sql
-      });
-    } else {
-      return res.json({ answer: parsed.reply });
-    }
+    const candidate = result.response.candidates?.[0];
+    const reply = candidate?.content?.parts?.[0]?.text || 'No response';
+    const grounding = candidate?.groundingMetadata?.searchEntryPoint || null;
+
+    res.json({ reply, grounding });
   } catch (err) {
-    console.error("AI error:", err.message);
+    console.error('Chat error:', err);
     res.status(500).json({ error: err.message });
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`✅ Backend running on port ${PORT}`));
+// SQL generation endpoint
+async function generateSQL(userPrompt) {
+  const schemaData = loadSchema();
+  const prompt = `
+You are a SQL expert.
+Schema:
+${JSON.stringify(schemaData, null, 2)}
+
+User wants: "${userPrompt}"
+
+1. Write SQL wrapped in a code block:
+\`\`\`sql
+SELECT ...
+\`\`\`
+2. Explain it naturally.
+`;
+  const result = await sqlModel.generateContent({
+    contents: [{ role: 'user', parts: [{ text: prompt }] }],
+    generationConfig: { temperature: 0.2, maxOutputTokens: 512 },
+  });
+  return result.response.candidates?.[0]?.content?.parts?.[0]?.text || '';
+}
+
+// SQL query endpoint
+// app.post('/query', async (req, res) => {
+//   try {
+//     const { question } = req.body;
+//     if (!question) return res.status(400).json({ error: 'Question is required' });
+
+//     const fullOutput = await generateSQL(question);
+//     const sqlBlock = fullOutput.match(/```sql\s*([\s\S]*?)```/i);
+//     const sql = sqlBlock ? sqlBlock[1].trim() : null;
+
+//     let rows = null;
+//     if (sql) {
+//       try {
+//         const dbRes = await pool.query(sql);
+//         rows = dbRes.rows;
+//       } catch (dbErr) {
+//         console.error('DB execution error:', dbErr);
+//         return res.status(400).json({ error: 'SQL execution failed', generatedSQL: sql, explanation: fullOutput });
+//       }
+//     }
+
+//     res.json({ generatedSQL: sql || 'No SQL', explanation: fullOutput, data: rows });
+//   } catch (err) {
+//     console.error('Query error:', err);
+//     res.status(500).json({ error: err.message });
+//   }
+// });
+
+// app.post('/query', async (req, res) => {
+//   try {
+//     const { question } = req.body;
+//     if (!question) return res.status(400).json({ error: 'Question is required' });
+
+//     const fullOutput = await generateSQL(question);
+//     const sqlBlock = fullOutput.match(/```sql\s*([\s\S]*?)```/i);
+//     const sql = sqlBlock ? sqlBlock[1].trim() : null;
+
+//     let rows = null;
+//     if (sql) {
+//       console.log("📝 AI Generated SQL Query:", sql); // <<-- LOGGING QUERY
+//       try {
+//         const dbRes = await pool.query(sql);
+//         console.log(`✅ Query executed successfully. Rows returned: ${dbRes.rowCount}`); // <<-- LOGGING EXECUTION RESULT
+//         rows = dbRes.rows;
+//       } catch (dbErr) {
+//         console.error('❌ DB execution error:', dbErr);
+//         return res.status(400).json({ error: 'SQL execution failed', generatedSQL: sql, explanation: fullOutput });
+//       }
+//     } else {
+//       console.warn("⚠️ No SQL generated by AI.");
+//     }
+
+//     res.json({ generatedSQL: sql || 'No SQL', explanation: fullOutput, data: rows });
+//   } catch (err) {
+//     console.error('Query error:', err);
+//     res.status(500).json({ error: err.message });
+//   }
+// });
+
+// app.post('/query', async (req, res) => {
+//   try {
+//     const { question } = req.body;
+//     if (!question) return res.status(400).json({ error: 'Question is required' });
+
+//     const fullOutput = await generateSQL(question);
+//     const sqlBlock = fullOutput.match(/```sql\s*([\s\S]*?)```/i);
+//     const sql = sqlBlock ? sqlBlock[1].trim() : null;
+
+//     let rows = null;
+//     let summary = 'No data returned.';
+
+//     if (sql) {
+//       console.log("📝 AI Generated SQL Query:", sql);
+//       console.log("📜 AI Explanation:", fullOutput);
+
+//       try {
+//         const dbRes = await pool.query(sql);
+//         console.log(`✅ Query executed successfully. Rows returned: ${dbRes.rowCount}`);
+//         console.log("📊 Query Result:", dbRes.rows);
+
+//         rows = dbRes.rows;
+
+//         // Build a friendly summary
+//         if (rows && rows.length === 1 && ('count' in rows[0] || 'total_loans_disbursed' in rows[0])) {
+//           const count = rows[0].count || rows[0].total_loans_disbursed;
+//           summary = `In the last requested period, ${count} loans were disbursed.`;
+//         } else if (rows && rows.length > 0) {
+//           summary = `Found ${rows.length} matching records.`;
+//         } else {
+//           summary = `No matching records found.`;
+//         }
+
+//       } catch (dbErr) {
+//         console.error('❌ DB execution error:', dbErr);
+//         return res.status(400).json({ error: 'SQL execution failed' });
+//       }
+//     } else {
+//       console.warn("⚠️ No SQL generated by AI.");
+//     }
+
+//     // 🚀 Send only friendly result to the front-end
+//     res.json({ summary });
+
+//   } catch (err) {
+//     console.error('Query error:', err);
+//     res.status(500).json({ error: err.message });
+//   }
+// });
+
+app.post('/query', async (req, res) => {
+  try {
+    const { question, history } = req.body;
+    if (!question) return res.status(400).json({ error: 'Question is required' });
+
+    // Build conversation prompt from history + latest question
+    let conversationText = '';
+    if (Array.isArray(history)) {
+      history.forEach(turn => {
+        const speaker = turn.role === 'user' ? 'User' : 'Bot';
+        conversationText += `${speaker}: ${turn.text}\n`;
+      });
+    }
+    conversationText += `User: ${question}\nBot:`;
+
+    const prompt = `
+You are a SQL expert assistant. Continue the conversation below and answer the user's questions based on the entire chat history.
+
+${conversationText}
+`;
+
+    // Prepare schema once
+    const schemaData = loadSchema();
+
+    const fullPrompt = `
+You are a SQL expert.
+Schema:
+${JSON.stringify(schemaData, null, 2)}
+
+User conversation:
+${prompt}
+
+1. Write SQL wrapped in a code block:
+\`\`\`sql
+SELECT ...
+\`\`\`
+2. Explain it naturally.
+`;
+
+    // Call Vertex AI SQL model
+    const result = await sqlModel.generateContent({
+      contents: [{ role: 'user', parts: [{ text: fullPrompt }] }],
+      generationConfig: { temperature: 0.2, maxOutputTokens: 512 },
+    });
+
+    const fullOutput = result.response.candidates?.[0]?.content?.parts?.[0]?.text || '';
+
+    // Extract SQL code block
+    const sqlBlock = fullOutput.match(/```sql\s*([\s\S]*?)```/i);
+    const sql = sqlBlock ? sqlBlock[1].trim() : null;
+
+    let rows = null;
+    let summary = 'No data returned.';
+
+    if (sql) {
+      console.log("📝 AI Generated SQL Query:", sql);
+      console.log("📜 AI Explanation:", fullOutput);
+
+      try {
+        const dbRes = await pool.query(sql);
+        console.log(`✅ Query executed successfully. Rows returned: ${dbRes.rowCount}`);
+        console.log("📊 Query Result:", dbRes.rows);
+
+        rows = dbRes.rows;
+
+        if (rows && rows.length === 1 && ('count' in rows[0] || 'total_loans_disbursed' in rows[0])) {
+          const count = rows[0].count || rows[0].total_loans_disbursed;
+          summary = `In the last requested period, ${count} loans were disbursed.`;
+        } else if (rows && rows.length > 0) {
+          summary = `Found ${rows.length} matching records.`;
+        } else {
+          summary = `No matching records found.`;
+        }
+
+      } catch (dbErr) {
+        console.error('❌ DB execution error:', dbErr);
+        return res.status(400).json({ error: 'SQL execution failed' });
+      }
+    } else {
+      console.warn("⚠️ No SQL generated by AI.");
+    }
+
+    res.json({ summary });
+
+  } catch (err) {
+    console.error('Query error:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+
+
+
+// Start server
+const PORT = process.env.PORT || 3002;
+app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
